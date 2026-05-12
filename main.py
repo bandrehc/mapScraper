@@ -114,6 +114,18 @@ Examples
                         metavar='PATH',
                         help='Save embedding matrix to a .npy file at this path')
 
+    # --- email enrichment -----------------------------------------------------
+    parser.add_argument('--enrich-emails', action='store_true',
+                        help='Discover personal/owner contact emails for each lead domain')
+    parser.add_argument('--email-max-pages', type=int, default=5, metavar='N',
+                        help='Max pages crawled per domain for email discovery (default: 5)')
+    parser.add_argument('--email-timeout', type=int, default=10, metavar='SEC',
+                        help='Per-page HTTP timeout for email crawl (default: 10)')
+    parser.add_argument('--email-concurrent', type=int, default=5, metavar='N',
+                        help='Concurrent domain crawls for email enrichment (default: 5)')
+    parser.add_argument('--email-include-dns', action='store_true',
+                        help='Add DNS sources (SOA/DMARC/SPF) — requires dnspython')
+
     # --- logging --------------------------------------------------------------
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                         default='INFO', help='Logging verbosity (default: INFO)')
@@ -158,6 +170,12 @@ def main() -> None:
         web_batch_size=args.web_batch_size,
         web_timeout=args.web_timeout,
         web_max_pages=args.web_max_pages,
+        # email enrichment
+        enrich_emails=args.enrich_emails,
+        email_max_pages=args.email_max_pages,
+        email_timeout=args.email_timeout,
+        email_concurrent=args.email_concurrent,
+        email_include_dns=args.email_include_dns,
         # clustering
         cluster_method=args.cluster_method,
         cluster_k=args.cluster_k,

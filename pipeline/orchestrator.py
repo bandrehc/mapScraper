@@ -124,6 +124,55 @@ def _run_enrichment(
     return df
 
 
+def _run_email_enrichment(
+    df: pd.DataFrame,
+    *,
+    max_concurrent: int,
+    timeout: int,
+    max_pages: int,
+    include_dns: bool,
+) -> pd.DataFrame:
+    """Append ``mails`` and ``destinataries`` columns via targeted email crawl.
+
+    Each domain is crawled asynchronously (aiohttp) up to *max_pages* pages,
+    prioritising contact / about / team pages.  Results are scored and filtered
+    to return only personal / owner-looking contacts.
+
+    When ``include_dns=True`` (and dnspython is installed) SOA / DMARC / SPF
+    records are also queried for additional email candidates.
+
+    Zero overhead when not called — the import is lazy and the feature is
+    entirely opt-in via ``--enrich-emails``.
+    """
+    from enrichment.email_enricher import EmailEnrichConfig, enrich_emails_batch
+
+    config = EmailEnrichConfig(
+        max_concurrent=max_concurrent,
+        timeout=timeout,
+        max_pages=max_pages,
+        include_dns=include_dns,
+    )
+
+    urls = df['url'].fillna('').tolist()
+    domains = df['domain'].fillna('').tolist()
+
+    active = sum(1 for u, d in zip(urls, domains) if u.strip() or d.strip())
+    logger.info(
+        "Email enrichment — %d/%d rows with domain/URL (max %d pages, %d concurrent) …",
+        active, len(df), max_pages, max_concurrent,
+    )
+
+    results = enrich_emails_batch(urls, domains, config=config)
+
+    df = df.copy()
+    df['mails'] = [r.mails_column for r in results]
+    df['destinataries'] = [r.destinataries_column for r in results]
+
+    found = sum(1 for r in results if r.candidates)
+    logger.info("Email enrichment complete — %d/%d domains with contacts found", found, len(df))
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Clustering stage
 # ---------------------------------------------------------------------------
@@ -198,6 +247,12 @@ def run_pipeline(
     web_batch_size: int = 50,
     web_timeout: int = 15,
     web_max_pages: int = 10,
+    # --- email enrichment (opt-in via --enrich-emails) ---
+    enrich_emails: bool = False,
+    email_max_pages: int = 5,
+    email_timeout: int = 10,
+    email_concurrent: int = 5,
+    email_include_dns: bool = False,
     # --- clustering ---
     cluster_method: str = 'kmeans',
     cluster_k: int = 8,
@@ -213,6 +268,10 @@ def run_pipeline(
     """Execute the pipeline in the requested mode.
 
     Modes: scrape | enrich | full | cluster
+
+    Email enrichment (``enrich_emails=True``) appends two columns to any
+    enriched CSV: ``mails`` and ``destinataries``.  It runs as a separate
+    async pass after web enrichment and has zero overhead when disabled.
     """
     mode = mode.lower().strip()
 
@@ -233,6 +292,14 @@ def run_pipeline(
             web_timeout=web_timeout,
             web_max_pages=web_max_pages,
         )
+        if enrich_emails:
+            df = _run_email_enrichment(
+                df,
+                max_concurrent=email_concurrent,
+                timeout=email_timeout,
+                max_pages=email_max_pages,
+                include_dns=email_include_dns,
+            )
         out = _enriched_path(input_path)
         _ensure_dir(out)
         df.to_csv(out, index=False)
@@ -252,6 +319,14 @@ def run_pipeline(
             web_timeout=web_timeout,
             web_max_pages=web_max_pages,
         )
+        if enrich_emails:
+            df = _run_email_enrichment(
+                df,
+                max_concurrent=email_concurrent,
+                timeout=email_timeout,
+                max_pages=email_max_pages,
+                include_dns=email_include_dns,
+            )
         out = _enriched_path(output_file)
         _ensure_dir(out)
         df.to_csv(out, index=False)
