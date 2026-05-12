@@ -23,6 +23,17 @@ Two entry points, fully independent:
 - Average star rating + review count
 - Concurrent async processing, configurable language / country
 
+### Email Enrichment (new — `--enrich-emails`)
+- **Personal contact discovery** — finds owner/operator emails for each business domain
+- **Personal-provider priority** — Gmail, Hotmail, Outlook, Yahoo, ProtonMail, iCloud, and 40+ more
+- **Aggressive generic filtering** — 113 patterns blocked: info@, contact@, support@, noreply@, admin@, …
+- **Corporate personal emails included** — `juan.perez@company.com` or `maria@startup.io` are valid leads
+- **Name inference** — derives owner name from username (`john.smith` → `John Smith`), mailto anchors, schema.org markup
+- **Priority crawl** — contact / about / team pages fetched before other links; max 5 pages per domain
+- **Optional DNS sources** — SOA, DMARC, SPF records via `--email-include-dns` (requires `dnspython`)
+- **Two new output columns** — `mails` (semicolon-separated) and `destinataries` (`Name <email>` format)
+- **Zero overhead when disabled** — module is never imported unless the flag is set
+
 ### Deep Enrichment (new)
 - **Multi-page crawling** — up to 10 pages per domain, prioritised by content type
 - **Business description** extraction (short from meta + long from body)
@@ -105,6 +116,7 @@ python mapScraperX.py --queries-file query_example.txt \
 | `enrich` | Load an existing CSV → deep enrichment → save enriched CSV |
 | `full` | Scrape first, then enrich the result |
 | `cluster` | Load any CSV → embed → cluster → append `cluster_id` + `cluster_label` |
+| `email` | Load any CSV with `url`/`domain` columns → discover personal contact emails only → save `*_emails.csv` |
 
 ### Examples
 
@@ -138,12 +150,32 @@ python main.py --mode cluster --input data/leads_enriched.csv \
 
 # Verbose debug output
 python main.py --mode cluster --input data/leads_enriched.csv --log-level DEBUG
+
+# ── Email-only mode (fastest — no web enrichment, no scoring) ─────────────
+# Discover personal contact emails from any existing CSV
+python main.py --mode email --input data/output.csv
+
+# Tune concurrency and page depth
+python main.py --mode email --input data/output.csv \
+  --email-max-pages 3 --email-concurrent 10
+
+# Include DNS sources (SOA / DMARC / SPF) — requires: pip install dnspython
+python main.py --mode email --input data/output.csv --email-include-dns
+
+# ── Email discovery combined with full enrichment ─────────────────────────
+# Enrich an existing CSV with deep web signals + email discovery
+python main.py --mode enrich --input data/output.csv --enrich-emails
+
+# Full pipeline: scrape + web enrich + email discovery in one command
+python main.py --mode full \
+  --queries-file query_example.txt \
+  --enrich-emails
 ```
 
 ### All options
 
 ```
---mode {scrape,enrich,full,cluster}  Pipeline mode (default: scrape)
+--mode {scrape,enrich,full,cluster,email}  Pipeline mode (default: scrape)
 query                                 Single search query
 --queries-file FILE                   File with one query per line
 --lang CODE                           Language code (default: en)
@@ -167,6 +199,11 @@ query                                 Single search query
 --cluster-no-cache                    Force re-encode (ignore cached embeddings)
 --cluster-adjust-scores               Apply cluster-based delta to lead score column
 --cluster-save-embeddings PATH        Save embedding matrix to .npy file
+--enrich-emails                       Discover personal/owner contact emails per domain
+--email-max-pages N                   Max pages crawled per domain for email discovery (default: 5)
+--email-timeout SEC                   Per-page HTTP timeout for email crawl (default: 10)
+--email-concurrent N                  Concurrent domain crawls for email enrichment (default: 5)
+--email-include-dns                   Add DNS sources (SOA/DMARC/SPF) — requires dnspython
 --log-level {DEBUG,INFO,...}          Logging verbosity (default: INFO)
 ```
 
@@ -267,6 +304,21 @@ query                                 Single search query
 | `score` | float 0–100 | Lead score (see breakdown below) |
 | `segment` | str | `micro / small / medium / large` |
 
+#### Email enrichment columns (`--mode email` or `--enrich-emails`)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `mails` | str | Semicolon-separated personal/owner emails, highest score first. Example: `john@gmail.com;maria@hotmail.com;juan.perez@company.com` |
+| `destinataries` | str | RFC 5322-style `Name <email>` entries, semicolon-separated. Example: `John Smith <john@gmail.com>; Maria Lopez <maria@hotmail.com>; Unknown <juan.perez@company.com>` |
+
+**Email scoring signals:** provider type (personal provider +40, corporate +15), username pattern (`name.surname` +35, `initial.surname` +22, single name +15), source page quality (contact page +15, about/team +12, other +5), multi-page recurrence (+5). Generic prefixes (`info@`, `contact@`, `support@`, `admin@`, `noreply@`, …) are hard-filtered to score 0 and never appear in output.
+
+**Name inference sources (in priority order):**
+1. Username splitting — `john.smith` → `John Smith` (confidence 0.70)
+2. `mailto:` anchor text — `<a href="mailto:…">John Smith</a>` (0.85)
+3. Proximity pattern — `John Smith <john@…>` (0.80)
+4. schema.org `itemprop="name"` near the email occurrence (0.75)
+
 ---
 
 ## Scoring breakdowns
@@ -302,6 +354,23 @@ Pages crawled, service category count, client section presence, tracking tools, 
 ### Digital maturity score (0–10)
 CMS presence, tracking stack depth, modern framework, contact section, client social proof, certifications.
 
+### Email score (0–100, `--enrich-emails` only)
+
+| Signal | Max pts | Notes |
+|--------|---------|-------|
+| Personal provider | 40 | Gmail, Hotmail, Outlook, Yahoo, ProtonMail, iCloud, AOL, Zoho, GMX, Yandex, … (49 providers) |
+| Corporate domain | 15 | Not excluded — counts if username looks like a name |
+| Generic prefix | 0 (excluded) | 113 patterns: info@, contact@, support@, admin@, noreply@, sales@, … |
+| Username: `name.surname` | +35 | john.smith, maria_lopez, juan-perez |
+| Username: `initial.surname` | +22 | j.smith, m.rodriguez |
+| Username: single name ≥5 chars | +15 | carlos, maria |
+| Username: single name 3–4 chars | +10 | |
+| Source: contact / contacto page | +15 | |
+| Source: about / team / staff page | +12 | |
+| Source: other page | +5 | |
+| Appears on multiple pages | +5 | confidence bonus |
+| **Inclusion threshold** | **≥ 25** | |
+
 ---
 
 ## Architecture
@@ -316,12 +385,41 @@ mapScraper/
 ├── enrichment/
 │   ├── features.py             feature engineering from CSV columns
 │   ├── web_scraper.py          deep async website crawl + signal extraction
+│   ├── email_enricher.py       personal email discovery (--enrich-emails)
 │   └── scoring.py              lead score (0–100) + segmentation
 ├── pipeline/
 │   └── orchestrator.py         run_pipeline() — wires all stages
 └── data/
     └── output.csv              scrape output (example)
 ```
+
+#### email_enricher.py internals
+
+```
+enrich_emails_batch(urls, domains)
+  └─ _run_email_batch_async(rows)  [asyncio.gather, semaphore-limited]
+       └─ _enrich_one_domain(url, domain)
+            ├─ _crawl_domain_for_emails(url)   [aiohttp, priority queue]
+            │    ├─ _fetch_page(url)
+            │    ├─ _extract_internal_links()  → priority_q (contact/about/team) + normal_q
+            │    └─ (repeat up to max_pages, priority queue first)
+            ├─ _build_candidates(pages)
+            │    ├─ _extract_raw_emails(html)  [mailget.extractors or inline fallback]
+            │    ├─ _page_label(url)           → source signal for scoring
+            │    ├─ score_email(email, sources)
+            │    │    ├─ _is_generic_prefix()  → hard filter (113 patterns)
+            │    │    ├─ provider type         → 40 pts (personal) / 15 pts (corporate)
+            │    │    ├─ _score_username()     → 0–35 pts
+            │    │    └─ source quality        → 0–20 pts
+            │    └─ infer_name(email, pages)
+            │         ├─ _name_from_username()  → username split (conf 0.70)
+            │         ├─ _name_from_context()   → mailto anchor (conf 0.85)
+            │         └─ schema.org itemprop    → (conf 0.75)
+            └─ _dns_candidates(domain)  [optional, asyncio, mailget.dns_utils]
+                 └─ SOA rname + DMARC rua + SPF TXT
+```
+
+**py-get-mail integration:** `mailget.extractors` (email regex, deobfuscation) and `mailget.dns_utils` (async DNS) are imported directly via `sys.path` injection — no subprocess, no shell wrapper. Falls back to inline implementations if the sibling repo is absent.
 
 ### web_scraper.py internals
 
@@ -369,8 +467,14 @@ enrich_websites(urls)
 | Fast web pass (homepage only) | `--web-max-pages 1 --web-concurrent 15` |
 | Standard deep crawl | `--web-max-pages 10 --web-concurrent 5` (default) |
 | Maximum depth | `--web-max-pages 15 --web-concurrent 3 --web-timeout 20` |
+| Email discovery only — any CSV (fastest) | `--mode email --input file.csv --email-concurrent 10` |
+| Email discovery only — skip deep web signals | `--mode email --input file.csv --email-max-pages 3` |
+| Email discovery combined with enrichment | `--mode enrich --input file.csv --enrich-emails` |
+| Email discovery, aggressive depth | `--mode email --input file.csv --email-max-pages 8 --email-concurrent 3` |
 
 For large CSVs (50k+ rows), web scraping is the bottleneck. Use `--no-web-scraping` first to get feature engineering and scoring, then run a second enrichment pass on high-scoring leads only.
+
+Email enrichment adds approximately **1–7 s per domain** (5 pages, 5 concurrent). Running it standalone with `--no-web-scraping` keeps total time well under 10 s per domain. Combined with full web enrichment the overhead is roughly 25–35%.
 
 ---
 
@@ -418,6 +522,15 @@ Client extraction uses heuristic NER (no heavy NLP library). Logo alt-texts are 
 
 **Large CSVs are slow to enrich**
 Web crawling is the bottleneck. Use `--no-web-scraping` for a fast first pass, then deep-crawl only the highest-scoring leads.
+
+**`mails` column is empty after `--enrich-emails`**
+The domain was unreachable, uses a contact form instead of mailto links, or only exposes generic addresses (info@, contact@) which are filtered out by design. Try `--log-level DEBUG` to see per-domain crawl details.
+
+**`destinataries` shows "Unknown" for all entries**
+Name inference requires a `Name <email>` pattern or a `mailto:` anchor with text in the page HTML. Sites that only list bare email addresses in plain text will produce "Unknown". The email address itself is still a valid outreach target.
+
+**`--email-include-dns` has no effect**
+The flag requires `dnspython`: `pip install dnspython`. Without it the DNS sources are silently skipped and web crawl results are used instead.
 
 ---
 

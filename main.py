@@ -37,6 +37,8 @@ Modes
   enrich   Load an existing CSV and add deep website signals + lead scores.
   full     Scrape, then enrich the result.
   cluster  Load any CSV (raw or enriched), embed + cluster, append cluster columns.
+  email    Load any CSV with url/domain columns, discover personal contact emails
+           only — no web enrichment, no scoring. Saves to *_emails.csv.
 
 Examples
 --------
@@ -48,12 +50,14 @@ Examples
   python main.py --mode cluster --input data/leads_enriched.csv
   python main.py --mode cluster --input data/leads_enriched.csv --cluster-method hdbscan --cluster-k 10
   python main.py --mode cluster --input data/leads_enriched.csv --cluster-adjust-scores
+  python main.py --mode email --input data/output.csv
+  python main.py --mode email --input data/output.csv --email-max-pages 3 --email-concurrent 10
         """,
     )
 
     parser.add_argument(
         '--mode',
-        choices=['scrape', 'enrich', 'full', 'cluster'],
+        choices=['scrape', 'enrich', 'full', 'cluster', 'email'],
         default='scrape',
         help='Pipeline mode (default: scrape)',
     )
@@ -153,6 +157,9 @@ def main() -> None:
             queries = _read_queries(args.queries_file)
         else:
             parser.error(f"--mode {args.mode} requires a query or --queries-file.")
+
+    if args.mode in ('enrich', 'cluster', 'email') and not args.input:
+        parser.error(f"--mode {args.mode} requires --input <path-to-csv>.")
 
     run_pipeline(
         mode=args.mode,

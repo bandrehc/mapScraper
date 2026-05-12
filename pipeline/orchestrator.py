@@ -8,6 +8,8 @@ scrape   Run the Google Maps scraper only. Outputs a raw CSV.
 enrich   Load an existing raw CSV, run enrichment, save an enriched CSV.
 full     Scrape first, then enrich the result.
 cluster  Load any CSV (raw or enriched), embed + cluster, append cluster columns.
+email    Load any CSV that has url/domain columns, run email enrichment only,
+         append mails + destinataries columns, save to *_emails.csv.
 
 The scraper and the enrichment step are never executed simultaneously —
 the orchestrator runs them sequentially within a single process.
@@ -41,6 +43,23 @@ def _ensure_dir(path: str) -> None:
 def _enriched_path(raw_path: str) -> str:
     base, ext = os.path.splitext(raw_path)
     return f"{base}_enriched{ext or '.csv'}"
+
+
+def _emails_path(input_path: str) -> str:
+    base, ext = os.path.splitext(input_path)
+    return f"{base}_emails{ext or '.csv'}"
+
+
+def _load_csv_for_emails(path: str) -> pd.DataFrame:
+    """Load any CSV that has at least a url or domain column."""
+    df = pd.read_csv(path, dtype=str)
+    if 'url' not in df.columns and 'domain' not in df.columns:
+        raise ValueError(
+            f"Input CSV must contain at least a 'url' or 'domain' column. "
+            f"Columns found: {list(df.columns)}"
+        )
+    logger.info("Loaded %d rows from %s", len(df), path)
+    return df
 
 
 def _clustered_path(input_path: str) -> str:
@@ -364,7 +383,26 @@ def run_pipeline(
         print(f"Clustered CSV:   {out}")
         print(f"Cluster summary: {summary_out}")
 
+    elif mode == 'email':
+        if not input_path:
+            raise ValueError("'email' mode requires --input <path-to-csv>.")
+        df = _load_csv_for_emails(input_path)
+        df = _run_email_enrichment(
+            df,
+            max_concurrent=email_concurrent,
+            timeout=email_timeout,
+            max_pages=email_max_pages,
+            include_dns=email_include_dns,
+        )
+        out = _emails_path(input_path)
+        _ensure_dir(out)
+        df.to_csv(out, index=False)
+        logger.info("Email-enriched CSV saved to %s", out)
+        found = df['mails'].str.strip().ne('').sum()
+        print(f"Email-enriched CSV: {out}")
+        print(f"Domains with emails found: {found}/{len(df)}")
+
     else:
         raise ValueError(
-            f"Unknown mode '{mode}'. Valid modes: scrape, enrich, full, cluster."
+            f"Unknown mode '{mode}'. Valid modes: scrape, enrich, full, cluster, email."
         )
