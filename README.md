@@ -26,12 +26,15 @@ Two entry points, fully independent:
 ### Email Enrichment (new — `--enrich-emails`)
 - **Personal contact discovery** — finds owner/operator emails for each business domain
 - **Personal-provider priority** — Gmail, Hotmail, Outlook, Yahoo, ProtonMail, iCloud, and 40+ more
-- **Aggressive generic filtering** — 113 patterns blocked: info@, contact@, support@, noreply@, admin@, …
-- **Corporate personal emails included** — `juan.perez@company.com` or `maria@startup.io` are valid leads
+- **Maximize capture first, filter later** — all emails found except hard-excluded ones are returned, sorted by score; generic role addresses (info@, contact@, ventas@) are included with a lower score so nothing is silently dropped
+- **Two-tier generic filtering** — hard-excluded (noreply@, daemon@, abuse@, bot@) never appear; soft-excluded (info@, contact@, ventas@, hola@) are included with score ~12-15 and sink below personal/corporate addresses
+- **Corporate personal emails included** — `juan.perez@company.com` or `maria@startup.io` score 30-80+ and rank above generic ones
 - **Name inference** — derives owner name from username (`john.smith` → `John Smith`), mailto anchors, schema.org markup
-- **Priority crawl** — contact / about / team pages fetched before other links; max 5 pages per domain
+- **Thorough crawl** — links discovered from every fetched page (not just homepage); contact/about/team pages drained before normal pages; asset/CMS files (woff2, webmanifest, feed, wp-json, wp-includes, chat) filtered from queue
+- **HTML entity decoding** — `info&#64;domain.com` style obfuscation decoded before regex runs
 - **Optional DNS sources** — SOA, DMARC, SPF records via `--email-include-dns` (requires `dnspython`)
 - **Two new output columns** — `mails` (semicolon-separated) and `destinataries` (`Name <email>` format)
+- **File logging** — all crawl events, raw pools, and scoring logged to `logs/email_enrichment.log` at DEBUG level automatically
 - **Zero overhead when disabled** — module is never imported unless the flag is set
 
 ### Deep Enrichment (new)
@@ -200,7 +203,7 @@ query                                 Single search query
 --cluster-adjust-scores               Apply cluster-based delta to lead score column
 --cluster-save-embeddings PATH        Save embedding matrix to .npy file
 --enrich-emails                       Discover personal/owner contact emails per domain
---email-max-pages N                   Max pages crawled per domain for email discovery (default: 5)
+--email-max-pages N                   Max pages crawled per domain for email discovery (default: 8)
 --email-timeout SEC                   Per-page HTTP timeout for email crawl (default: 10)
 --email-concurrent N                  Concurrent domain crawls for email enrichment (default: 5)
 --email-include-dns                   Add DNS sources (SOA/DMARC/SPF) — requires dnspython
@@ -311,7 +314,7 @@ query                                 Single search query
 | `mails` | str | Semicolon-separated personal/owner emails, highest score first. Example: `john@gmail.com;maria@hotmail.com;juan.perez@company.com` |
 | `destinataries` | str | RFC 5322-style `Name <email>` entries, semicolon-separated. Example: `John Smith <john@gmail.com>; Maria Lopez <maria@hotmail.com>; Unknown <juan.perez@company.com>` |
 
-**Email scoring signals:** provider type (personal provider +40, corporate +15), username pattern (`name.surname` +35, `initial.surname` +22, single name +15), source page quality (contact page +15, about/team +12, other +5), multi-page recurrence (+5). Generic prefixes (`info@`, `contact@`, `support@`, `admin@`, `noreply@`, …) are hard-filtered to score 0 and never appear in output.
+**Email scoring signals:** provider type (personal provider +40, corporate +15), username pattern (`name.surname` +35, `initial.surname` +22, single name +15), source page quality (contact page +15, about/team +12, other +5), multi-page recurrence (+5). Two-tier generic filtering: hard-excluded prefixes (`noreply@`, `daemon@`, `abuse@`, `bot@`, `postmaster@`, …) are never returned; soft-excluded prefixes (`info@`, `contact@`, `support@`, `hello@`, `ventas@`, …) are filtered from the main pool but returned as a low-score fallback (≈12 pts) when no personal or corporate email is found. A valid email address check also discards false positives from retina image filenames (e.g. `avatar@2x.png`).
 
 **Name inference sources (in priority order):**
 1. Username splitting — `john.smith` → `John Smith` (confidence 0.70)
@@ -360,7 +363,8 @@ CMS presence, tracking stack depth, modern framework, contact section, client so
 |--------|---------|-------|
 | Personal provider | 40 | Gmail, Hotmail, Outlook, Yahoo, ProtonMail, iCloud, AOL, Zoho, GMX, Yandex, … (49 providers) |
 | Corporate domain | 15 | Not excluded — counts if username looks like a name |
-| Generic prefix | 0 (excluded) | 113 patterns: info@, contact@, support@, admin@, noreply@, sales@, … |
+| Hard-excluded prefix | never returned | noreply@, daemon@, abuse@, bot@, postmaster@, notifications@, … (~40 patterns) |
+| Soft-excluded prefix | fallback only | info@, contact@, support@, hello@, ventas@, admin@, … (~70 patterns) — returned at score ≈12 when nothing personal found |
 | Username: `name.surname` | +35 | john.smith, maria_lopez, juan-perez |
 | Username: `initial.surname` | +22 | j.smith, m.rodriguez |
 | Username: single name ≥5 chars | +15 | carlos, maria |
@@ -369,7 +373,7 @@ CMS presence, tracking stack depth, modern framework, contact section, client so
 | Source: about / team / staff page | +12 | |
 | Source: other page | +5 | |
 | Appears on multiple pages | +5 | confidence bonus |
-| **Inclusion threshold** | **≥ 25** | |
+| **Inclusion threshold** | **≥ 25** (personal/corporate) | Fallback generic uses fixed score ≈12 |
 
 ---
 
@@ -389,6 +393,8 @@ mapScraper/
 │   └── scoring.py              lead score (0–100) + segmentation
 ├── pipeline/
 │   └── orchestrator.py         run_pipeline() — wires all stages
+├── logs/
+│   └── email_enrichment.log    per-domain crawl + extraction log (DEBUG level, auto-created)
 └── data/
     └── output.csv              scrape output (example)
 ```
@@ -397,24 +403,30 @@ mapScraper/
 
 ```
 enrich_emails_batch(urls, domains)
+  ├─ _setup_file_logger()  → logs/email_enrichment.log (DEBUG, idempotent)
   └─ _run_email_batch_async(rows)  [asyncio.gather, semaphore-limited]
        └─ _enrich_one_domain(url, domain)
             ├─ _crawl_domain_for_emails(url)   [aiohttp, priority queue]
             │    ├─ _fetch_page(url)
             │    ├─ _extract_internal_links()  → priority_q (contact/about/team) + normal_q
+            │    │    └─ _SKIP_RE filters: asset files (woff2, ico, webmanifest, …),
+            │    │                         /feed, /rss, /wp-json/, /cache/, /fonts/
             │    └─ (repeat up to max_pages, priority queue first)
-            ├─ _build_candidates(pages)
+            ├─ _build_candidates(pages, domain)
             │    ├─ _extract_raw_emails(html)  [mailget.extractors or inline fallback]
+            │    │    └─ _is_valid_email_address()  → rejects avatar@2x.png style false positives
             │    ├─ _page_label(url)           → source signal for scoring
             │    ├─ score_email(email, sources)
-            │    │    ├─ _is_generic_prefix()  → hard filter (113 patterns)
+            │    │    ├─ _is_hard_excluded()   → noreply/daemon/bot — never returned
+            │    │    ├─ _is_soft_excluded()   → info/contact — filtered, fallback only
             │    │    ├─ provider type         → 40 pts (personal) / 15 pts (corporate)
             │    │    ├─ _score_username()     → 0–35 pts
             │    │    └─ source quality        → 0–20 pts
-            │    └─ infer_name(email, pages)
-            │         ├─ _name_from_username()  → username split (conf 0.70)
-            │         ├─ _name_from_context()   → mailto anchor (conf 0.85)
-            │         └─ schema.org itemprop    → (conf 0.75)
+            │    ├─ infer_name(email, pages)
+            │    │    ├─ _name_from_username()  → username split (conf 0.70)
+            │    │    ├─ _name_from_context()   → mailto anchor (conf 0.85)
+            │    │    └─ schema.org itemprop    → (conf 0.75)
+            │    └─ _build_fallback_generic()  → best info@/contact@ when pool is empty
             └─ _dns_candidates(domain)  [optional, asyncio, mailget.dns_utils]
                  └─ SOA rname + DMARC rua + SPF TXT
 ```
@@ -468,9 +480,9 @@ enrich_websites(urls)
 | Standard deep crawl | `--web-max-pages 10 --web-concurrent 5` (default) |
 | Maximum depth | `--web-max-pages 15 --web-concurrent 3 --web-timeout 20` |
 | Email discovery only — any CSV (fastest) | `--mode email --input file.csv --email-concurrent 10` |
-| Email discovery only — skip deep web signals | `--mode email --input file.csv --email-max-pages 3` |
+| Email discovery — default (8 pages, thorough) | `--mode email --input file.csv` |
 | Email discovery combined with enrichment | `--mode enrich --input file.csv --enrich-emails` |
-| Email discovery, aggressive depth | `--mode email --input file.csv --email-max-pages 8 --email-concurrent 3` |
+| Email discovery, maximum depth | `--mode email --input file.csv --email-max-pages 15 --email-concurrent 3` |
 
 For large CSVs (50k+ rows), web scraping is the bottleneck. Use `--no-web-scraping` first to get feature engineering and scoring, then run a second enrichment pass on high-scoring leads only.
 
@@ -524,7 +536,10 @@ Client extraction uses heuristic NER (no heavy NLP library). Logo alt-texts are 
 Web crawling is the bottleneck. Use `--no-web-scraping` for a fast first pass, then deep-crawl only the highest-scoring leads.
 
 **`mails` column is empty after `--enrich-emails`**
-The domain was unreachable, uses a contact form instead of mailto links, or only exposes generic addresses (info@, contact@) which are filtered out by design. Try `--log-level DEBUG` to see per-domain crawl details.
+The domain was unreachable (0 pages crawled), uses only a contact form with no mailto links, or the site requires JavaScript to render — aiohttp cannot execute JS. Generic addresses (info@, contact@) are now returned as a low-score fallback when no personal email is found, so a truly empty cell means no email of any kind was discovered. Check `logs/email_enrichment.log` for the per-domain crawl trace.
+
+**Email enrichment is slow or producing zero results on many domains**
+Most JS-heavy SPAs return a shell HTML with no links — the crawl stays at 1 page and finds nothing. This is a fundamental limitation of static HTTP crawling. JS-rendered sites require a headless browser (Playwright/Puppeteer) which is outside the current scope. Increase `--email-max-pages` for static sites to get better contact page coverage.
 
 **`destinataries` shows "Unknown" for all entries**
 Name inference requires a `Name <email>` pattern or a `mailto:` anchor with text in the page HTML. Sites that only list bare email addresses in plain text will produce "Unknown". The email address itself is still a valid outreach target.

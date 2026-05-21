@@ -85,6 +85,39 @@ _EMAIL_RE = re.compile(
     r"(?:mailto:)?([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})"
 )
 
+# TLDs that are really file extensions — e.g. testimonial_avatar@2x.png
+_FILE_EXT_TLDS: frozenset = frozenset([
+    'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'bmp', 'tiff',
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+    'css', 'js', 'ts', 'jsx', 'tsx', 'json', 'xml', 'csv',
+    'zip', 'tar', 'gz', 'rar',
+    'mp3', 'mp4', 'wav', 'avi', 'mov', 'webm', 'ogg',
+    'woff', 'woff2', 'ttf', 'eot', 'otf',
+    'php', 'asp', 'aspx', 'py', 'rb', 'go',
+])
+
+# Retina image suffixes like @2x, @3x used in filename-as-email false positives
+_RETINA_RE = re.compile(r'^\d+x$', re.IGNORECASE)
+
+
+def _is_valid_email_address(email: str) -> bool:
+    """Return False for obvious non-emails (e.g., avatar@2x.png)."""
+    try:
+        _, domain_part = email.lower().rsplit('@', 1)
+    except ValueError:
+        return False
+    parts = domain_part.split('.')
+    if len(parts) < 2:
+        return False
+    tld = parts[-1]
+    if tld in _FILE_EXT_TLDS:
+        return False
+    if _RETINA_RE.match(parts[0]):
+        return False
+    if len(tld) < 2:
+        return False
+    return True
+
 _DEOBFUSCATE: List[Tuple[re.Pattern, str]] = [
     (re.compile(r'\s*\[\s*at\s*\]\s*', re.I), '@'),
     (re.compile(r'\s+at\s+', re.I), '@'),
@@ -118,10 +151,18 @@ def _inline_extract(text: str) -> List[str]:
 
 
 def _extract_raw_emails(text: str) -> List[str]:
-    """Extract + normalise emails; reuses mailget primitives when available."""
+    """Extract + normalise emails; reuses mailget primitives when available.
+
+    Decodes HTML entities first so that ``info&#64;domain.com`` obfuscation
+    is caught before the regex runs.
+    """
+    import html as _html_mod
+    decoded = _html_mod.unescape(text)
     if _MAILGET_EXTRACTORS:
-        return _mg_extract_emails(text, ())   # no pre-filtering — we score later
-    return _inline_extract(text)
+        raw = _mg_extract_emails(decoded, ())
+    else:
+        raw = _inline_extract(decoded)
+    return [e for e in raw if _is_valid_email_address(e)]
 
 
 # ---------------------------------------------------------------------------
@@ -153,37 +194,47 @@ PERSONAL_PROVIDERS: frozenset = frozenset([
     'fastmail.com', 'fastmail.fm',
 ])
 
-# Generic / non-human prefixes — score is forced to 0 (excluded from output)
-GENERIC_PREFIXES: frozenset = frozenset([
-    'info', 'information', 'contact', 'contacto', 'contacts', 'contactus',
+# Hard-excluded — automated/bounce addresses: never returned, even as fallback
+_HARD_EXCLUDED_PREFIXES: frozenset = frozenset([
+    'noreply', 'no-reply', 'noresponder', 'do-not-reply', 'donotreply',
+    'notifications', 'notificaciones', 'alerts', 'alertas', 'noti',
+    'daemon', 'mailer', 'mailer-daemon', 'robot', 'bot', 'system',
+    'abuse', 'spam', 'bounce', 'bounces',
+    'postmaster', 'hostmaster', 'webmaster',
+    'unsubscribe', 'register', 'signup',
+    'api', 'security', 'devsecurity',
+])
+
+# Soft-excluded — generic role addresses: filtered normally, but returned as
+# last-resort fallback when no personal/corporate email is found
+_SOFT_EXCLUDED_PREFIXES: frozenset = frozenset([
+    'info', 'information',
+    'contact', 'contacto', 'contacts', 'contactus',
     'support', 'soporte', 'help', 'ayuda', 'helpcenter', 'helpdesk',
     'admin', 'administrator', 'administrador', 'administration',
-    'noreply', 'no-reply', 'noresponder', 'do-not-reply', 'donotreply',
     'sales', 'ventas', 'comercial', 'commerce',
     'office', 'oficina',
     'legal', 'privacy', 'privacidad', 'dpo',
     'jobs', 'careers', 'empleo', 'trabajo', 'hr', 'humanresources', 'recruiting',
     'billing', 'facturas', 'payments', 'invoices', 'accounts',
-    'notifications', 'notificaciones', 'alerts', 'alertas', 'noti',
-    'webmaster', 'hostmaster', 'postmaster', 'abuse',
     'hello', 'hola', 'hi', 'hey',
     'team', 'equipo',
     'service', 'services', 'servicio', 'servicios',
     'customer', 'customers', 'clients',
     'marketing', 'newsletter', 'news',
     'press', 'media', 'mediarelations', 'pr',
-    'security', 'devsecurity',
     'general', 'enquiries', 'enquiry', 'inquiry', 'inquiries',
     'mail', 'email', 'correo',
-    'api', 'bot', 'system', 'daemon', 'robot',
     'reservations', 'reservas', 'booking', 'bookings',
     'reception', 'recepcion',
     'feedback', 'suggestions', 'partners',
     'data', 'gdpr', 'compliance',
-    'registration', 'register', 'signup', 'unsubscribe',
-    'order', 'orders', 'shop', 'store',
+    'registration', 'order', 'orders', 'shop', 'store',
     'office1', 'office2', 'info1', 'info2', 'contact1', 'contact2',
 ])
+
+# Combined set — kept for backward compatibility with external callers
+GENERIC_PREFIXES: frozenset = _HARD_EXCLUDED_PREFIXES | _SOFT_EXCLUDED_PREFIXES
 
 # ---------------------------------------------------------------------------
 # HTTP constants
@@ -208,11 +259,16 @@ _SKIP_RE = re.compile(
     r'/\d{4}/\d{2}/'
     r'|/page/\d+'
     r'|/tag/|/category/|/author/'
-    r'|/feed/|/rss'
+    r'|/feed(?:/|$)|/rss(?:/|$)'
     r'|/wp-admin/|/wp-login'
+    r'|/wp-json(?:/|$)|/wp-includes/|/wp-content/plugins/'
+    r'|/xmlrpc'
+    r'|/chat/'
     r'|/admin/|/login|/register|/signup'
     r'|/checkout|/cart|/account'
-    r'|\.(pdf|jpg|jpeg|png|gif|svg|webp|css|js|xml|json|zip)$',
+    r'|/cache/|/fonts/'
+    r'|\.(pdf|jpg|jpeg|png|gif|svg|webp|css|js|xml|json|zip'
+    r'|woff2?|ttf|eot|otf|ico|webmanifest|mp4|mp3|webm|wav|ogg)$',
     re.I,
 )
 
@@ -236,11 +292,10 @@ class EmailEnrichConfig:
     good coverage of personal / owner contact emails.
     """
 
-    max_pages: int = 5               # pages crawled per domain
+    max_pages: int = 8                # pages crawled per domain
     timeout: int = 10                # per-request HTTP timeout (s)
     max_concurrent: int = 5          # concurrent domain crawls
-    min_score: float = 25.0          # minimum score to include an email
-    max_emails_per_domain: int = 5   # max emails returned per domain
+    max_emails_per_domain: int = 10  # max emails returned per domain (sorted by score)
     include_dns: bool = False         # enable DNS sources (requires dnspython)
     dns_timeout: float = 4.0         # per-DNS-query timeout (s)
 
@@ -301,16 +356,28 @@ class EmailEnrichResult:
 # ---------------------------------------------------------------------------
 
 
-def _is_generic_prefix(local: str) -> bool:
-    """True if the local part is a known generic/non-human address prefix."""
-    if local in GENERIC_PREFIXES:
+def _prefix_match(local: str, prefix_set: frozenset) -> bool:
+    if local in prefix_set:
         return True
-    # Numbered variants: info1, info2, contact1
-    if re.sub(r'\d+$', '', local) in GENERIC_PREFIXES:
+    if re.sub(r'\d+$', '', local) in prefix_set:
         return True
-    # Hyphen/underscore/dot-collapsed variants: no-reply → noreply
     collapsed = local.replace('-', '').replace('_', '').replace('.', '')
-    return collapsed in GENERIC_PREFIXES
+    return collapsed in prefix_set
+
+
+def _is_hard_excluded(local: str) -> bool:
+    """True for bounce/automation addresses — never return, not even as fallback."""
+    return _prefix_match(local, _HARD_EXCLUDED_PREFIXES)
+
+
+def _is_soft_excluded(local: str) -> bool:
+    """True for generic role addresses — skipped normally, used as fallback."""
+    return not _is_hard_excluded(local) and _prefix_match(local, _SOFT_EXCLUDED_PREFIXES)
+
+
+def _is_generic_prefix(local: str) -> bool:
+    """True if the local part is any known generic/non-human address prefix."""
+    return _prefix_match(local, GENERIC_PREFIXES)
 
 
 def classify_provider(email: str) -> str:
@@ -404,8 +471,8 @@ _MAILTO_ANCHOR_RE = re.compile(
     re.IGNORECASE,
 )
 _NAME_BEFORE_EMAIL_RE_TEMPLATE = (
-    r'([A-ZÁÉÍÓÚÜÑÀ][a-záéíóúüñà]{1,25}'
-    r'(?:\s+[A-ZÁÉÍÓÚÜÑÀ][a-záéíóúüñà]{1,25}){1,3})'
+    r'([A-ZÁÉÍÓÚÜÑÀ][a-záéíóúüñà]{{1,25}}'
+    r'(?:\s+[A-ZÁÉÍÓÚÜÑÀ][a-záéíóúüñà]{{1,25}}){{1,3}})'
     r'\s{{0,10}}[<(]?\s*(?:mailto:)?{email}'
 )
 _SCHEMA_NAME_RE = re.compile(
@@ -612,16 +679,20 @@ async def _crawl_domain_for_emails(
             text = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
 
             pages.append({'url': current, 'html_raw': html, 'text': text})
+            logger.debug("[email] fetched %s", current)
 
-            # Discover more links from homepage and whenever queue is exhausted
-            if len(pages) == 1 or (not priority_q and not normal_q):
-                pri, nrm = _extract_internal_links(html, current, base_netloc)
-                for link in pri:
-                    if link not in visited and link not in priority_q:
-                        priority_q.append(link)
-                for link in nrm:
-                    if link not in visited and link not in normal_q:
-                        normal_q.append(link)
+            # Discover links from every page — maximises contact/about/team coverage
+            pri, nrm = _extract_internal_links(html, current, base_netloc)
+            for link in pri:
+                if link not in visited and link not in priority_q:
+                    priority_q.append(link)
+            for link in nrm:
+                if link not in visited and link not in normal_q:
+                    normal_q.append(link)
+            logger.debug(
+                "[email] queue after %s — priority: %d, normal: %d",
+                current, len(priority_q), len(normal_q),
+            )
 
     return pages
 
@@ -642,11 +713,49 @@ def _page_label(url: str) -> str:
     return 'page'
 
 
+def _generic_score(local: str, email_domain: str, domain: str) -> float:
+    """Low-priority score for soft-excluded (generic-prefix) emails.
+
+    Domain-matching generic addresses (info@same-domain.com) score ~12-15.
+    Same-name cross-TLD addresses (ventas@company.com for company.pe) score ~8.
+    Unrelated cross-domain ones score 2-3 and sink to the bottom.
+    """
+    domain_clean = re.sub(r'^www\.', '', domain.lower())
+    email_domain_clean = re.sub(r'^www\.', '', email_domain.lower())
+    exact_match = (
+        email_domain_clean == domain_clean
+        or domain_clean.endswith('.' + email_domain_clean)
+    )
+    # Same business name, different TLD (e.g. company.com vs company.pe)
+    stem_match = (
+        not exact_match
+        and domain_clean.split('.')[0] == email_domain_clean.split('.')[0]
+    )
+    score = 12.0 if exact_match else (8.0 if stem_match else 3.0)
+    norm_local = re.sub(r'\d+$', '', local)
+    if norm_local in ('contact', 'contacto', 'info', 'hola', 'hello', 'ventas', 'sales'):
+        score += 3.0
+    return score
+
+
 def _build_candidates(
     pages: List[Dict],
     config: EmailEnrichConfig,
+    domain: str = '',
 ) -> List[EmailCandidate]:
-    """Extract, score, and name-infer all email candidates from *pages*."""
+    """Extract and score ALL email candidates found across *pages*.
+
+    Inclusion policy:
+    - Hard-excluded (noreply, daemon, abuse, …): always skipped.
+    - Soft-excluded (info@, contact@, ventas@, …): included with a low
+      domain-match score (~12-15) — they rank below personal/corporate
+      addresses but are never suppressed.  The caller (and the user's
+      CSV) can decide what to do with them.
+    - Personal / corporate: scored 0-100 via score_email(); all kept
+      regardless of threshold so nothing is lost.
+
+    Results are sorted highest→lowest score.
+    """
     email_sources: Dict[str, List[str]] = {}
 
     for page in pages:
@@ -654,20 +763,34 @@ def _build_candidates(
         label = _page_label(page['url'])
         for email in raw_emails:
             email = email.lower()
-            if email not in email_sources:
-                email_sources[email] = []
+            email_sources.setdefault(email, [])
             if label not in email_sources[email]:
                 email_sources[email].append(label)
 
+    logger.debug("[email] raw email pool for %s: %s", domain or 'unknown', list(email_sources))
+
     candidates: List[EmailCandidate] = []
     for email, sources in email_sources.items():
-        if classify_provider(email) == 'generic':
-            continue   # hard filter — no point scoring
-
-        s = score_email(email, sources)
-        if s < config.min_score:
+        try:
+            local, email_domain = email.split('@', 1)
+        except ValueError:
             continue
 
+        if _is_hard_excluded(local):
+            logger.debug("[email] hard-excluded: %s", email)
+            continue
+
+        if _is_soft_excluded(local):
+            s = _generic_score(local, email_domain, domain)
+            candidates.append(EmailCandidate(
+                email=email,
+                score=s,
+                provider_type='generic',
+                sources=sources,
+            ))
+            continue
+
+        s = score_email(email, sources)
         name, conf = infer_name(email, pages)
         provider_type = classify_provider(email)
 
@@ -681,7 +804,12 @@ def _build_candidates(
         ))
 
     candidates.sort(key=lambda c: c.score, reverse=True)
-    # Keep extra headroom so DNS merge below can deduplicate
+    logger.debug(
+        "[email] candidates for %s (%d total): %s",
+        domain or 'unknown',
+        len(candidates),
+        [(c.email, c.score) for c in candidates[:10]],
+    )
     return candidates[: config.max_emails_per_domain * 3]
 
 
@@ -715,19 +843,22 @@ async def _dns_candidates(
 
         out: List[EmailCandidate] = []
         for email in dns_emails:
-            if classify_provider(email) == 'generic':
+            try:
+                local, _ = email.split('@', 1)
+            except ValueError:
+                continue
+            if _is_hard_excluded(local):
                 continue
             s = score_email(email, ['dns'])
-            if s >= config.min_score:
-                name, conf = infer_name(email)
-                out.append(EmailCandidate(
-                    email=email,
-                    score=s,
-                    provider_type=classify_provider(email),
-                    name_guess=name,
-                    name_confidence=conf,
-                    sources=['dns'],
-                ))
+            name, conf = infer_name(email)
+            out.append(EmailCandidate(
+                email=email,
+                score=s,
+                provider_type=classify_provider(email),
+                name_guess=name,
+                name_confidence=conf,
+                sources=['dns'],
+            ))
         return out
     except Exception as exc:
         logger.debug("[email] DNS error for %s: %s", domain, exc)
@@ -753,7 +884,13 @@ async def _enrich_one_domain(
         # 1. Web crawl (priority: contact/about/team pages)
         start = url or ('https://' + domain if domain else '')
         pages = await _crawl_domain_for_emails(session, start, semaphore, config)
-        web_candidates = _build_candidates(pages, config) if pages else []
+        logger.info(
+            "[email] %s — crawled %d page(s): %s",
+            domain or url,
+            len(pages),
+            ', '.join(p['url'] for p in pages),
+        )
+        web_candidates = _build_candidates(pages, config, domain=domain) if pages else []
 
         # 2. DNS sources (optional, async)
         dns_cands = await _dns_candidates(domain, config)
@@ -775,9 +912,13 @@ async def _enrich_one_domain(
         logger.debug("[email] Unexpected error for %s: %s", domain, exc)
 
     result.elapsed_seconds = round(time.monotonic() - t0, 2)
-    logger.debug(
-        "[email] %s — %d candidates in %.1fs",
-        domain or url, len(result.candidates), result.elapsed_seconds,
+    found_emails = [c.email for c in result.candidates]
+    logger.info(
+        "[email] %s — %d candidate(s) in %.1fs%s",
+        domain or url,
+        len(result.candidates),
+        result.elapsed_seconds,
+        f": {found_emails}" if found_emails else " (none found)",
     )
     return result
 
@@ -794,6 +935,40 @@ async def _run_email_batch_async(
             for url, domain in rows
         ]
         return await asyncio.gather(*tasks)
+
+
+# ---------------------------------------------------------------------------
+# File logging
+# ---------------------------------------------------------------------------
+
+_FILE_LOGGER_INSTALLED = False
+
+
+def _setup_file_logger() -> None:
+    """Add a FileHandler to the email_enricher logger (idempotent)."""
+    global _FILE_LOGGER_INSTALLED
+    if _FILE_LOGGER_INSTALLED:
+        return
+    logs_dir = os.path.normpath(os.path.join(_HERE, '..', 'logs'))
+    os.makedirs(logs_dir, exist_ok=True)
+    log_file = os.path.join(logs_dir, 'email_enrichment.log')
+
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)-8s %(name)s — %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+
+    _log = logging.getLogger(__name__)
+    if not any(isinstance(h, logging.FileHandler) for h in _log.handlers):
+        _log.addHandler(fh)
+    # Ensure DEBUG messages reach the file even when root logger is INFO
+    if _log.level == logging.NOTSET or _log.level > logging.DEBUG:
+        _log.setLevel(logging.DEBUG)
+
+    _FILE_LOGGER_INSTALLED = True
+    _log.info("[email] File logger initialised → %s", log_file)
 
 
 # ---------------------------------------------------------------------------
@@ -835,6 +1010,8 @@ def enrich_emails_batch(
     List[EmailEnrichResult] — one entry per input row, in the same order.
     Rows with no URL and no domain return an empty result (no candidates).
     """
+    _setup_file_logger()
+
     if config is None:
         config = EmailEnrichConfig(
             max_concurrent=max_concurrent,

@@ -268,7 +268,7 @@ def run_pipeline(
     web_max_pages: int = 10,
     # --- email enrichment (opt-in via --enrich-emails) ---
     enrich_emails: bool = False,
-    email_max_pages: int = 5,
+    email_max_pages: int = 8,
     email_timeout: int = 10,
     email_concurrent: int = 5,
     email_include_dns: bool = False,

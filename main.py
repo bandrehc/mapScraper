@@ -121,8 +121,8 @@ Examples
     # --- email enrichment -----------------------------------------------------
     parser.add_argument('--enrich-emails', action='store_true',
                         help='Discover personal/owner contact emails for each lead domain')
-    parser.add_argument('--email-max-pages', type=int, default=5, metavar='N',
-                        help='Max pages crawled per domain for email discovery (default: 5)')
+    parser.add_argument('--email-max-pages', type=int, default=8, metavar='N',
+                        help='Max pages crawled per domain for email discovery (default: 8)')
     parser.add_argument('--email-timeout', type=int, default=10, metavar='SEC',
                         help='Per-page HTTP timeout for email crawl (default: 10)')
     parser.add_argument('--email-concurrent', type=int, default=5, metavar='N',
